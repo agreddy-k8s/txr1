@@ -1,0 +1,228 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - '*.sql'
+      - '*.py'
+      - 'databricks.yml'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: databricks-secrets  # Variable group containing DATABRICKS_HOST, DATABRICKS_TOKEN, ANTHROPIC_API_KEY
+  - name: pythonVersion
+    value: '3.10'
+  - name: databricksWorkspacePath
+    value: '/Workspace/Users/$(Build.RequestedForEmail)/txr1'
+
+stages:
+  - stage: Build
+    displayName: 'Build and Validate'
+    jobs:
+      - job: ValidateCode
+        displayName: 'Validate Python and SQL Code'
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(pythonVersion)'
+            displayName: 'Use Python $(pythonVersion)'
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install databricks-sdk anthropic sqlparse
+            displayName: 'Install Python dependencies'
+
+          - script: |
+              # Validate Python syntax
+              python -m py_compile 02_extract_pdfs_to_bronze.py
+              python -m py_compile upload_to_volume.py
+              python -m py_compile rrc_scraper.py
+              echo "Python validation successful"
+            displayName: 'Validate Python syntax'
+
+          - script: |
+              # Basic SQL validation using sqlparse
+              python -c "
+              import sqlparse
+              import sys
+              
+              sql_files = [
+                  '01_create_schemas_and_tables.sql',
+                  '03_transform_bronze_to_silver.sql'
+              ]
+              
+              for sql_file in sql_files:
+                  with open(sql_file, 'r') as f:
+                      sql = f.read()
+                      parsed = sqlparse.parse(sql)
+                      if not parsed:
+                          print(f'Error parsing {sql_file}')
+                          sys.exit(1)
+                      print(f'{sql_file} validated successfully')
+              "
+            displayName: 'Validate SQL syntax'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.SourcesDirectory)'
+              ArtifactName: 'databricks-code'
+              publishLocation: 'Container'
+            displayName: 'Publish artifacts'
+
+  - stage: DeployDev
+    displayName: 'Deploy to Dev'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+    jobs:
+      - deployment: DeployToDatabricksDev
+        displayName: 'Deploy to Databricks Dev Workspace'
+        environment: 'databricks-dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: databricks-code
+
+                - task: UsePythonVersion@0
+                  inputs:
+                    versionSpec: '$(pythonVersion)'
+                  displayName: 'Use Python $(pythonVersion)'
+
+                - script: |
+                    pip install databricks-cli
+                  displayName: 'Install Databricks CLI'
+
+                - script: |
+                    # Configure Databricks CLI
+                    echo "[DEFAULT]" > ~/.databrickscfg
+                    echo "host = $(DATABRICKS_HOST)" >> ~/.databrickscfg
+                    echo "token = $(DATABRICKS_TOKEN)" >> ~/.databrickscfg
+                  displayName: 'Configure Databricks CLI'
+
+                - script: |
+                    # Create workspace directory
+                    databricks workspace mkdirs $(databricksWorkspacePath)
+                  displayName: 'Create workspace directory'
+
+                - script: |
+                    # Upload Python scripts
+                    databricks workspace import \
+                      $(Pipeline.Workspace)/databricks-code/02_extract_pdfs_to_bronze.py \
+                      $(databricksWorkspacePath)/02_extract_pdfs_to_bronze.py \
+                      --language PYTHON \
+                      --overwrite
+                    
+                    databricks workspace import \
+                      $(Pipeline.Workspace)/databricks-code/upload_to_volume.py \
+                      $(databricksWorkspacePath)/upload_to_volume.py \
+                      --language PYTHON \
+                      --overwrite
+                    
+                    databricks workspace import \
+                      $(Pipeline.Workspace)/databricks-code/rrc_scraper.py \
+                      $(databricksWorkspacePath)/rrc_scraper.py \
+                      --language PYTHON \
+                      --overwrite
+                  displayName: 'Upload Python scripts to workspace'
+
+                - script: |
+                    # Upload SQL scripts
+                    databricks workspace import \
+                      $(Pipeline.Workspace)/databricks-code/01_create_schemas_and_tables.sql \
+                      $(databricksWorkspacePath)/01_create_schemas_and_tables.sql \
+                      --language SQL \
+                      --overwrite
+                    
+                    databricks workspace import \
+                      $(Pipeline.Workspace)/databricks-code/03_transform_bronze_to_silver.sql \
+                      $(databricksWorkspacePath)/03_transform_bronze_to_silver.sql \
+                      --language SQL \
+                      --overwrite
+                  displayName: 'Upload SQL scripts to workspace'
+
+                - script: |
+                    echo "Deployment to Dev completed successfully"
+                    echo "Scripts available at: $(databricksWorkspacePath)"
+                  displayName: 'Deployment summary'
+
+  - stage: DeployProd
+    displayName: 'Deploy to Production'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployToDatabricksProd
+        displayName: 'Deploy to Databricks Production Workspace'
+        environment: 'databricks-prod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: databricks-code
+
+                - task: UsePythonVersion@0
+                  inputs:
+                    versionSpec: '$(pythonVersion)'
+                  displayName: 'Use Python $(pythonVersion)'
+
+                - script: |
+                    pip install databricks-cli
+                  displayName: 'Install Databricks CLI'
+
+                - script: |
+                    # Configure Databricks CLI for Production
+                    echo "[DEFAULT]" > ~/.databrickscfg
+                    echo "host = $(DATABRICKS_HOST_PROD)" >> ~/.databrickscfg
+                    echo "token = $(DATABRICKS_TOKEN_PROD)" >> ~/.databrickscfg
+                  displayName: 'Configure Databricks CLI for Production'
+
+                - script: |
+                    # Create workspace directory
+                    databricks workspace mkdirs $(databricksWorkspacePath)
+                  displayName: 'Create workspace directory'
+
+                - script: |
+                    # Upload Python scripts
+                    databricks workspace import \
+                      $(Pipeline.Workspace)/databricks-code/02_extract_pdfs_to_bronze.py \
+                      $(databricksWorkspacePath)/02_extract_pdfs_to_bronze.py \
+                      --language PYTHON \
+                      --overwrite
+                    
+                    databricks workspace import \
+                      $(Pipeline.Workspace)/databricks-code/upload_to_volume.py \
+                      $(databricksWorkspacePath)/upload_to_volume.py \
+                      --language PYTHON \
+                      --overwrite
+                    
+                    databricks workspace import \
+                      $(Pipeline.Workspace)/databricks-code/rrc_scraper.py \
+                      $(databricksWorkspacePath)/rrc_scraper.py \
+                      --language PYTHON \
+                      --overwrite
+                  displayName: 'Upload Python scripts to workspace'
+
+                - script: |
+                    # Upload SQL scripts
+                    databricks workspace import \
+                      $(Pipeline.Workspace)/databricks-code/01_create_schemas_and_tables.sql \
+                      $(databricksWorkspacePath)/01_create_schemas_and_tables.sql \
+                      --language SQL \
+                      --overwrite
+                    
+                    databricks workspace import \
+                      $(Pipeline.Workspace)/databricks-code/03_transform_bronze_to_silver.sql \
+                      $(databricksWorkspacePath)/03_transform_bronze_to_silver.sql \
+                      --language SQL \
+                      --overwrite
+                  displayName: 'Upload SQL scripts to workspace'
+
+                - script: |
+                    echo "Deployment to Production completed successfully"
+                    echo "Scripts available at: $(databricksWorkspacePath)"
+                  displayName: 'Deployment summary'

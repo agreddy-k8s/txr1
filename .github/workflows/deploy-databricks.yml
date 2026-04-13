@@ -1,0 +1,183 @@
+name: Deploy to Databricks
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - '**.py'
+      - '**.sql'
+      - '.github/workflows/**'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  validate:
+    name: Validate Code
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate Python syntax
+        run: |
+          python -m py_compile 02_extract_pdfs_to_bronze.py
+          python -m py_compile upload_to_volume.py
+          python -m py_compile rrc_scraper.py
+          echo "✅ Python validation successful"
+
+      - name: Validate SQL syntax
+        run: |
+          python -c "
+          import sqlparse
+          import sys
+          
+          sql_files = [
+              '01_create_schemas_and_tables.sql',
+              '03_transform_bronze_to_silver.sql'
+          ]
+          
+          for sql_file in sql_files:
+              with open(sql_file, 'r') as f:
+                  sql = f.read()
+                  parsed = sqlparse.parse(sql)
+                  if not parsed:
+                      print(f'❌ Error parsing {sql_file}')
+                      sys.exit(1)
+                  print(f'✅ {sql_file} validated successfully')
+          "
+
+  deploy-dev:
+    name: Deploy to Dev
+    needs: validate
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment: databricks-dev
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Databricks CLI
+        run: |
+          pip install databricks-cli
+
+      - name: Configure Databricks CLI
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          echo "[DEFAULT]" > ~/.databrickscfg
+          echo "host = $DATABRICKS_HOST" >> ~/.databrickscfg
+          echo "token = $DATABRICKS_TOKEN" >> ~/.databrickscfg
+
+      - name: Create workspace directory
+        run: |
+          databricks workspace mkdirs /Workspace/Users/${{ secrets.DATABRICKS_USER }}/txr1 || true
+
+      - name: Deploy Python scripts
+        run: |
+          for file in *.py; do
+            if [ -f "$file" ]; then
+              echo "Uploading $file..."
+              databricks workspace import "$file" \
+                "/Workspace/Users/${{ secrets.DATABRICKS_USER }}/txr1/$file" \
+                --language PYTHON \
+                --overwrite
+            fi
+          done
+
+      - name: Deploy SQL scripts
+        run: |
+          for file in *.sql; do
+            if [ -f "$file" ]; then
+              echo "Uploading $file..."
+              databricks workspace import "$file" \
+                "/Workspace/Users/${{ secrets.DATABRICKS_USER }}/txr1/$file" \
+                --language SQL \
+                --overwrite
+            fi
+          done
+
+      - name: Deployment summary
+        run: |
+          echo "✅ Deployment to Dev completed successfully"
+          echo "📁 Scripts available at: /Workspace/Users/${{ secrets.DATABRICKS_USER }}/txr1/"
+
+  deploy-prod:
+    name: Deploy to Production
+    needs: validate
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: databricks-prod  # Requires manual approval
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Databricks CLI
+        run: |
+          pip install databricks-cli
+
+      - name: Configure Databricks CLI
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST_PROD }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN_PROD }}
+        run: |
+          echo "[DEFAULT]" > ~/.databrickscfg
+          echo "host = $DATABRICKS_HOST" >> ~/.databrickscfg
+          echo "token = $DATABRICKS_TOKEN" >> ~/.databrickscfg
+
+      - name: Create workspace directory
+        run: |
+          databricks workspace mkdirs /Workspace/Users/${{ secrets.DATABRICKS_USER }}/txr1 || true
+
+      - name: Deploy Python scripts
+        run: |
+          for file in *.py; do
+            if [ -f "$file" ]; then
+              echo "Uploading $file..."
+              databricks workspace import "$file" \
+                "/Workspace/Users/${{ secrets.DATABRICKS_USER }}/txr1/$file" \
+                --language PYTHON \
+                --overwrite
+            fi
+          done
+
+      - name: Deploy SQL scripts
+        run: |
+          for file in *.sql; do
+            if [ -f "$file" ]; then
+              echo "Uploading $file..."
+              databricks workspace import "$file" \
+                "/Workspace/Users/${{ secrets.DATABRICKS_USER }}/txr1/$file" \
+                --language SQL \
+                --overwrite
+            fi
+          done
+
+      - name: Deployment summary
+        run: |
+          echo "✅ Deployment to Production completed successfully"
+          echo "📁 Scripts available at: /Workspace/Users/${{ secrets.DATABRICKS_USER }}/txr1/"

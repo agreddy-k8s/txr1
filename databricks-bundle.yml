@@ -1,0 +1,118 @@
+# Databricks Asset Bundle configuration
+bundle:
+  name: txr1_rrc_pipeline
+
+# Include configuration for different environments
+include:
+  - resources/*.yml
+
+# Workspace configuration
+workspace:
+  host: ${var.databricks_host}
+
+# Artifacts to deploy
+artifacts:
+  default:
+    type: whl
+    path: .
+
+# Variables
+variables:
+  catalog:
+    description: Unity Catalog name
+    default: workspace
+  
+  bronze_schema:
+    description: Bronze schema name
+    default: txrr1_bronze
+  
+  silver_schema:
+    description: Silver schema name
+    default: txrr1_silver
+
+# Targets for different environments
+targets:
+  dev:
+    mode: development
+    workspace:
+      host: ${var.databricks_host_dev}
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/dev
+    variables:
+      environment: dev
+      warehouse_id: ${var.warehouse_id_dev}
+
+  prod:
+    mode: production
+    workspace:
+      host: ${var.databricks_host_prod}
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/prod
+    variables:
+      environment: prod
+      warehouse_id: ${var.warehouse_id_prod}
+    
+    # Run validations before deployment
+    run_as:
+      service_principal_name: ${var.service_principal_name}
+
+# Resources to deploy
+resources:
+  jobs:
+    rrc_extraction_job:
+      name: "RRC PDF Extraction - ${var.environment}"
+      
+      tasks:
+        - task_key: create_schemas
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./01_create_schemas_and_tables.sql
+        
+        - task_key: extract_pdfs
+          depends_on:
+            - task_key: create_schemas
+          python_wheel_task:
+            package_name: txr1_pipeline
+            entry_point: extract_pdfs
+          libraries:
+            - pypi:
+                package: anthropic
+            - pypi:
+                package: databricks-sdk
+          
+        - task_key: transform_to_silver
+          depends_on:
+            - task_key: extract_pdfs
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./03_transform_bronze_to_silver.sql
+      
+      schedule:
+        quartz_cron_expression: "0 0 2 * * ?"  # Daily at 2 AM
+        timezone_id: "America/Chicago"
+        pause_status: PAUSED
+      
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+      
+      max_concurrent_runs: 1
+      timeout_seconds: 7200
+
+  pipelines:
+    rrc_dlt_pipeline:
+      name: "RRC DLT Pipeline - ${var.environment}"
+      catalog: ${var.catalog}
+      target: ${var.silver_schema}
+      
+      libraries:
+        - notebook:
+            path: ./02_extract_pdfs_to_bronze.py
+      
+      clusters:
+        - label: default
+          num_workers: 1
+          node_type_id: Standard_DS3_v2
+      
+      continuous: false
+      development: ${{ targets.dev.mode == 'development' }}
